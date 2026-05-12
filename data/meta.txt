@@ -1,0 +1,16 @@
+# llm.c data preparation summary
+corpus:       data/corpus.txt
+vocab_file:   data/tokenizer.vocab
+vocab_size:   512
+n_documents:  53
+train_split:  0.90
+add_bos:      1
+add_eos:      1
+
+train_tokens: 12841  (0.01 M)
+val_tokens:   1490  (0.00 M)
+total_tokens: 14331  (0.01 M)
+
+# Approx training epochs before data exhaustion
+# (batch_size=8, seq_len=512 → 4096 tokens/step)
+steps_per_epoch: 4
