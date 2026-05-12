@@ -55,12 +55,3 @@ make test       # run unit tests
 
 ./build/generate checkpoints/ckpt_00500.bin data/tokenizer.vocab --prompt "The transformer" --temp 0.7 
 ```
-
-## Phase Roadmap
-
-- [x] Phase 0: Project scaffold
-- [ ] Phase 1: Matrix ops + forward pass
-- [ ] Phase 2: Backprop + training loop
-- [ ] Phase 3: Tokenizer + data pipeline
-- [ ] Phase 4: SIMD optimizations
-- [ ] Phase 5: MoE + distillation
