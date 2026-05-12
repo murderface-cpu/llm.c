@@ -1,11 +1,9 @@
-# llm.c
-
 A lean, efficient Large Language Model built from scratch in pure C.
 
 ## Architecture Highlights
 
 - Modern Transformer: RMSNorm + SwiGLU + RoPE + Grouped Query Attention
-- Sliding window attention — O(n·w) not O(n²)
+- Sliding window attention - O(n·w) not O(n²)
 - Mixture of Experts (MoE) FFN layer support
 - SIMD-accelerated matrix operations
 - Knowledge distillation training support
@@ -43,11 +41,11 @@ make test       # run unit tests
 ```
 # Step 1 - build a small vocabulary (512 merges is plenty)
 
-./build/build_vocab data/TinyStories-train.txt 512 data/tokenizer.vocab
+./build/build_vocab data/corpus.txt 512 data/tokenizer.vocab
 
 # Step 2 - tokenise
 
-./build/prepare_data data/TinyStories-train.txt data/tokenizer.vocab
+./build/prepare_data data/corpus.txt data/tokenizer.vocab
 
 # Step 3 - train (auto-configures to tiny model, ~2000 steps)
 
