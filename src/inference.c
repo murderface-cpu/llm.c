@@ -394,84 +394,93 @@ static int cmp_desc(const void *a, const void *b) {
 int sample_token(float *logits, int vocab_size,
                  const SamplerConfig *cfg, uint64_t *rng_state) {
 
+    /* Greedy shortcut */
+    if (cfg->temperature <= 0.0f)
+        return sample_argmax(logits, vocab_size);
+
     /* Temperature scaling */
-    if (cfg->temperature <= 0.0f || cfg->temperature == 1.0f) {
-        /* temperature=0 → greedy */
-        if (cfg->temperature <= 0.0f) return sample_argmax(logits, vocab_size);
-    } else {
+    if (cfg->temperature != 1.0f) {
         float inv_temp = 1.0f / cfg->temperature;
         for (int i = 0; i < vocab_size; i++) logits[i] *= inv_temp;
     }
 
-    /* Softmax */
+    /* Numerically-stable softmax */
     float vmax = logits[0];
     for (int i = 1; i < vocab_size; i++) if (logits[i] > vmax) vmax = logits[i];
     float sum = 0.0f;
-    for (int i = 0; i < vocab_size; i++) { logits[i] = expf(logits[i]-vmax); sum += logits[i]; }
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = expf(logits[i] - vmax);
+        sum += logits[i];
+    }
+    if (sum < 1e-10f) return sample_argmax(logits, vocab_size); /* degenerate */
     float inv = 1.0f / sum;
     for (int i = 0; i < vocab_size; i++) logits[i] *= inv;
 
-    /* Top-k: zero out all but the k highest-prob tokens */
-    int k = cfg->top_k;
-    if (k > 0 && k < vocab_size) {
-        /* Partial sort: find k-th largest threshold */
-        IndexedFloat *sorted = (IndexedFloat *)malloc(
-                                   vocab_size * sizeof(IndexedFloat));
+    /* Suppress special tokens from being generated:
+     * UNK(0) = unknown, BOS(1) = begin-of-sequence, PAD(3) = padding
+     * These should never appear in model output — zero them before sampling.
+     * EOS(2) is kept so the model can end generation naturally. */
+    logits[0] = 0.0f;  /* UNK */
+    logits[1] = 0.0f;  /* BOS */
+    logits[3] = 0.0f;  /* PAD */
+    /* Renormalise after suppressing special tokens */
+    { float s2 = 0.f;
+      for (int i = 0; i < vocab_size; i++) s2 += logits[i];
+      if (s2 > 1e-10f) { float inv2 = 1.f/s2; for (int i=0;i<vocab_size;i++) logits[i]*=inv2; } }
+
+    /* Allocate scratch for top-k / top-p (shared between both) */
+    IndexedFloat *sorted = NULL;
+    int k = (cfg->top_k > 0 && cfg->top_k < vocab_size) ? cfg->top_k : 0;
+    float p = (cfg->top_p > 0.0f && cfg->top_p < 1.0f) ? cfg->top_p : 0.0f;
+
+    if (k > 0 || p > 0.0f) {
+        sorted = (IndexedFloat *)malloc(vocab_size * sizeof(IndexedFloat));
         for (int i = 0; i < vocab_size; i++) {
             sorted[i].val = logits[i]; sorted[i].idx = i;
         }
         qsort(sorted, vocab_size, sizeof(IndexedFloat), cmp_desc);
 
-        /* Zero everything below rank k */
-        float threshold = sorted[k-1].val;
-        for (int i = 0; i < vocab_size; i++)
-            if (logits[i] < threshold) logits[i] = 0.0f;
-
-        /* Renormalise */
-        sum = 0.0f;
-        for (int i = 0; i < vocab_size; i++) sum += logits[i];
-        if (sum > 0.0f) { inv = 1.0f / sum;
-                          for (int i=0; i<vocab_size; i++) logits[i] *= inv; }
-        free(sorted);
-    }
-
-    /* Top-p (nucleus): keep the smallest set of tokens whose cumulative
-     * probability exceeds p, zero the rest */
-    float p = cfg->top_p;
-    if (p > 0.0f && p < 1.0f) {
-        IndexedFloat *sorted = (IndexedFloat *)malloc(
-                                   vocab_size * sizeof(IndexedFloat));
-        for (int i = 0; i < vocab_size; i++) {
-            sorted[i].val = logits[i]; sorted[i].idx = i;
-        }
-        qsort(sorted, vocab_size, sizeof(IndexedFloat), cmp_desc);
-
-        float cumsum = 0.0f;
+        /* Top-k: mark everything below rank k as zero */
         int cutoff = vocab_size;
-        for (int i = 0; i < vocab_size; i++) {
-            cumsum += sorted[i].val;
-            if (cumsum >= p) { cutoff = i + 1; break; }
+        if (k > 0) cutoff = k;
+
+        /* Top-p: tighten cutoff if nucleus is smaller */
+        if (p > 0.0f) {
+            float cumsum = 0.0f;
+            for (int i = 0; i < cutoff; i++) {
+                cumsum += sorted[i].val;
+                if (cumsum >= p) { cutoff = i + 1; break; }
+            }
         }
 
-        /* Zero tokens beyond cutoff */
-        for (int i = cutoff; i < vocab_size; i++) logits[sorted[i].idx] = 0.0f;
+        /* Zero everything outside the cutoff */
+        for (int i = cutoff; i < vocab_size; i++)
+            logits[sorted[i].idx] = 0.0f;
 
-        /* Renormalise */
+        /* Renormalise — if everything is zero fall back to argmax */
         sum = 0.0f;
         for (int i = 0; i < vocab_size; i++) sum += logits[i];
-        if (sum > 0.0f) { inv = 1.0f / sum;
-                          for (int i=0; i<vocab_size; i++) logits[i] *= inv; }
+        if (sum < 1e-10f) {
+            int best_idx = sorted[0].idx;  /* save before free */
+            free(sorted);
+            return best_idx;
+        }
+        inv = 1.0f / sum;
+        for (int i = 0; i < vocab_size; i++) logits[i] *= inv;
         free(sorted);
     }
 
-    /* Sample from the filtered distribution */
+    /* Categorical sample via CDF walk */
     float r = rand_float(rng_state);
     float cdf = 0.0f;
+    int best = 0;
+    float best_p = logits[0];
     for (int i = 0; i < vocab_size; i++) {
+        if (logits[i] > best_p) { best_p = logits[i]; best = i; }
         cdf += logits[i];
         if (r < cdf) return i;
     }
-    return vocab_size - 1;   /* fallback */
+    return best;  /* numerical safety: return highest-prob token */
 }
 
 /* =========================================================================

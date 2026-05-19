@@ -113,22 +113,25 @@ static inline ModelConfig model_config_compute(ModelConfig cfg) {
 }
 
 static inline ModelConfig model_config_default(void) {
+    /* "Medium" model — genuinely useful for 1-50MB text corpora.
+     * ~25M parameters. Trains in hours on CPU, minutes with a GPU.
+     * For tiny corpora (< 500KB) use model_config_tiny() instead.     */
     ModelConfig cfg = {
-        .vocab_size    = 4096,    /* matches build_vocab default output size  */
-        .max_seq_len   = 512,     /* sensible default; increase for longer ctx */
-        .d_model       = 256,     /* smaller default — trains on CPU          */
-        .n_layers      = 4,
-        .n_heads       = 4,
-        .n_kv_heads    = 2,       /* GQA: 2 query heads share each KV head   */
-        .head_dim      = 0,       /* computed below via model_config_compute  */
-        .window_size   = 128,     /* sliding window attention span            */
-        .ffn_hidden    = 768,     /* ~3× d_model                             */
-        .n_experts     = 1,       /* start dense; flip to 8 for MoE later    */
+        .vocab_size    = 4096,
+        .max_seq_len   = 512,
+        .d_model       = 512,
+        .n_layers      = 6,
+        .n_heads       = 8,
+        .n_kv_heads    = 2,
+        .head_dim      = 64,     /* 512 / 8 */
+        .window_size   = 256,
+        .ffn_hidden    = 1536,   /* 3× d_model */
+        .n_experts     = 1,
         .top_k_experts = 1,
         .rms_norm_eps  = 1e-5f,
         .rope_theta    = 10000.0f,
     };
-    return model_config_compute(cfg);
+    return cfg;
 }
 
 static inline TrainConfig train_config_default(void) {
@@ -136,24 +139,24 @@ static inline TrainConfig train_config_default(void) {
         .train_data_path    = "data/train.bin",
         .val_data_path      = "data/val.bin",
         .learning_rate      = 3e-4f,
-        .lr_min             = 1e-5f,
+        .lr_min             = 3e-5f,    /* don't decay too low */
         .beta1              = 0.9f,
         .beta2              = 0.95f,
         .epsilon            = 1e-8f,
         .weight_decay       = 0.1f,
         .grad_clip          = 1.0f,
-        .warmup_steps       = 2000,
-        .max_steps          = 100000,
-        .batch_size         = 8,
-        .seq_len            = 512,
+        .warmup_steps       = 200,
+        .max_steps          = 5000,
+        .batch_size         = 4,        /* conservative — works on any CPU */
+        .seq_len            = 256,      /* shorter sequences = more variety */
         .dropout            = 0.0f,
-        .label_smoothing    = 0.1f,
+        .label_smoothing    = 0.05f,    /* light smoothing */
         .use_distillation   = 0,
         .distill_alpha      = 0.5f,
         .teacher_logits_path= NULL,
         .checkpoint_dir     = "checkpoints/",
-        .save_every         = 1000,
-        .eval_every         = 500,
+        .save_every         = 500,
+        .eval_every         = 250,
     };
     return cfg;
 }
@@ -202,8 +205,9 @@ static inline ModelConfig model_config_tiny(void) {
 
 /** config_small — ~7M params, trains well on a corpus of a few MB */
 static inline ModelConfig model_config_small(void) {
+    /* ~7M parameters — good for 500K to 5M token corpora */
     ModelConfig cfg = {
-        .vocab_size    = 2048,
+        .vocab_size    = 4096,
         .max_seq_len   = 512,
         .d_model       = 256,
         .n_layers      = 6,
@@ -242,8 +246,8 @@ static inline TrainConfig train_config_tiny(void) {
         .distill_alpha      = 0.5f,
         .teacher_logits_path= NULL,
         .checkpoint_dir     = "checkpoints/",
-        .save_every         = 500,
-        .eval_every         = 200,
+        .save_every         = 200,    /* tiny: save every 200 steps         */
+        .eval_every         = 100,
     };
     return cfg;
 }
@@ -256,30 +260,47 @@ static inline TrainConfig train_config_tiny(void) {
  */
 static inline void config_auto(long n_train_tokens, int vocab_size,
                                 ModelConfig *mcfg, TrainConfig *tcfg) {
-    if (n_train_tokens < 50000L) {
+    /*
+     * Auto-selects model size and training schedule based on corpus size.
+     *
+     * Thresholds tuned so the model can MEMORISE the training data at minimum
+     * and potentially generalise if the corpus is large enough.
+     *
+     * Rule of thumb: need ~10 tokens per parameter for basic memorisation.
+     * model_config_tiny  ~1M params → good for up to  ~500K tokens
+     * model_config_small ~7M params → good for up to   ~5M tokens
+     * model_config_default ~25M    → good for up to  ~50M tokens
+     */
+    if (n_train_tokens < 500000L) {
         *mcfg = model_config_tiny();
         *tcfg = train_config_tiny();
         fprintf(stderr,
             "[config_auto] tiny corpus (%ld tokens) → tiny model (1M params)\n"
-            "              Expect memorisation, not generalisation.\n",
-            n_train_tokens);
-    } else if (n_train_tokens < 2000000L) {
+            "              Expect memorisation only.\n", n_train_tokens);
+    } else if (n_train_tokens < 5000000L) {
         *mcfg = model_config_small();
         *tcfg = train_config_default();
-        tcfg->max_steps    = (int)(n_train_tokens / (tcfg->batch_size * tcfg->seq_len)) * 10;
+        /* Scale steps: ~10 passes over data */
+        long steps_per_epoch = n_train_tokens / (tcfg->batch_size * tcfg->seq_len);
+        tcfg->max_steps    = (int)(steps_per_epoch * 10);
         tcfg->warmup_steps = tcfg->max_steps / 20;
+        tcfg->save_every   = tcfg->max_steps / 10;
+        tcfg->eval_every   = tcfg->save_every / 2;
         fprintf(stderr,
-            "[config_auto] small corpus (%ld tokens) → small model (7M params)\n"
-            "              max_steps=%d\n",
+            "[config_auto] medium corpus (%ld tokens) → small model (7M params)\n"
+            "              max_steps=%d, ~10 epochs\n",
             n_train_tokens, tcfg->max_steps);
     } else {
         *mcfg = model_config_default();
         *tcfg = train_config_default();
-        tcfg->max_steps    = (int)(n_train_tokens / (tcfg->batch_size * tcfg->seq_len)) * 3;
+        long steps_per_epoch = n_train_tokens / (tcfg->batch_size * tcfg->seq_len);
+        tcfg->max_steps    = (int)(steps_per_epoch * 5);
         tcfg->warmup_steps = tcfg->max_steps / 20;
+        tcfg->save_every   = tcfg->max_steps / 10;
+        tcfg->eval_every   = tcfg->save_every / 2;
         fprintf(stderr,
-            "[config_auto] large corpus (%ld tokens) → default model (50M params)\n"
-            "              max_steps=%d\n",
+            "[config_auto] large corpus (%ld tokens) → medium model (25M params)\n"
+            "              max_steps=%d, ~5 epochs\n",
             n_train_tokens, tcfg->max_steps);
     }
     mcfg->vocab_size = vocab_size;

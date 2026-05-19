@@ -435,69 +435,103 @@ void train(Model *m, const TrainConfig *tcfg) {
     int   *batch_in  = (int *)malloc((size_t)bs * seq_len * sizeof(int));
     int   *batch_tgt = (int *)malloc((size_t)bs * seq_len * sizeof(int));
 
-    printf("[train] starting: %d steps, batch=%d, seq=%d\n",
-           tcfg->max_steps, bs, seq_len);
+    long tokens_per_step = (long)bs * seq_len;
+    printf("[train] %d steps | batch=%d | seq=%d | %.1fM tok/epoch\n",
+           tcfg->max_steps, bs, seq_len,
+           (double)tokens_per_step * tcfg->max_steps / 1e6);
     printf("[train] model params: %ldM\n", model_param_count(m) / 1000000);
+    printf("\n%-6s  %-8s  %-8s  %-8s  %-8s  %-8s\n",
+           "step", "loss", "smooth", "val", "lr", "ms/step");
+    printf("%s\n", "------------------------------------------------------");
 
-    double total_loss  = 0.0;
-    clock_t t_start    = clock();
+    double total_loss   = 0.0;
+    double smooth_loss  = -1.0;   /* EMA of loss, init on first step */
+    double smooth_alpha = 0.05;   /* EMA coefficient: smaller = smoother */
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    struct timespec step_t0, step_t1;
+
+    /* Pre-allocate validation logits scratch to avoid alloc in hot path */
+    Matrix val_logits = mat_alloc(seq_len, m->cfg.vocab_size, 0);
 
     for (int step = 0; step < tcfg->max_steps; step++) {
+        clock_gettime(CLOCK_MONOTONIC, &step_t0);
+
         float lr = lr_schedule(step,
                                tcfg->warmup_steps, tcfg->max_steps,
                                tcfg->learning_rate, tcfg->lr_min);
 
-        /* Zero gradients before accumulating */
         model_zero_grads(m);
 
-        /* Gradient accumulation over batch
-         * (run backward for each sample, then step once) */
         float step_loss = 0.0f;
         for (int b = 0; b < bs; b++) {
             dataloader_next_batch(train_dl,
                                   batch_in  + b * seq_len,
                                   batch_tgt + b * seq_len,
                                   1, seq_len);
-
-            float sample_loss = model_backward(m,
-                                               batch_in  + b * seq_len,
-                                               batch_tgt + b * seq_len,
-                                               seq_len);
-            step_loss += sample_loss;
+            step_loss += model_backward(m,
+                                        batch_in  + b * seq_len,
+                                        batch_tgt + b * seq_len,
+                                        seq_len);
         }
         step_loss /= (float)bs;
 
-        /* Gradient clipping */
         float grad_norm = clip_grad_norm(m, tcfg->grad_clip);
-
-        /* Optimiser step */
         adam_step(adam, m, tcfg, lr);
 
         total_loss += step_loss;
 
-        /* Logging */
+        /* Exponential moving average of loss — much less noisy than raw */
+        if (smooth_loss < 0.0) smooth_loss = step_loss;
+        else smooth_loss = smooth_alpha * step_loss + (1.0 - smooth_alpha) * smooth_loss;
+
+        clock_gettime(CLOCK_MONOTONIC, &step_t1);
+        double ms_step = (step_t1.tv_sec - step_t0.tv_sec) * 1000.0
+                       + (step_t1.tv_nsec - step_t0.tv_nsec) / 1e6;
+
+        /* Log every 10 steps */
         if (step % 10 == 0) {
-            double elapsed = (double)(clock() - t_start) / CLOCKS_PER_SEC;
-            printf("step %5d | loss %.4f | lr %.2e | gnorm %.3f | %.1fs\n",
-                   step, step_loss, (double)lr,
-                   (double)grad_norm, elapsed);
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double elapsed = (ts1.tv_sec - ts0.tv_sec)
+                           + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+            (void)elapsed;
+            printf("%-6d  %-8.4f  %-8.4f  %-8s  %-8.2e  %-6.0f  gnorm=%.1f\n",
+                   step,
+                   step_loss,
+                   smooth_loss,
+                   "---",
+                   (double)lr,
+                   ms_step,
+                   (double)grad_norm);
+            fflush(stdout);
         }
 
-        /* Validation */
+        /* Validation — actually compute cross-entropy loss */
         if (tcfg->eval_every > 0 && step % tcfg->eval_every == 0 && step > 0) {
-            /* Run a few validation batches */
             float val_loss = 0.0f;
             int   val_steps = 20;
             for (int vs = 0; vs < val_steps; vs++) {
                 dataloader_next_batch(val_dl, batch_in, batch_tgt, 1, seq_len);
-                Matrix logits = mat_alloc(seq_len, m->cfg.vocab_size, 0);
-                model_forward(m, batch_in, seq_len, &logits);
-                /* Approximate val loss from logits — just use CE inline here */
-                /* (full val loss requires targets and CE computation)         */
-                mat_free(&logits);
+                model_forward(m, batch_in, seq_len, &val_logits);
+                /* Compute cross-entropy from logits + targets */
+                float vl = 0.0f;
+                int V = m->cfg.vocab_size;
+                for (int t = 0; t < seq_len; t++) {
+                    float *row = val_logits.data + t * V;
+                    int    tgt = batch_tgt[t];
+                    float  vmax = row[0];
+                    for (int j = 1; j < V; j++) if (row[j] > vmax) vmax = row[j];
+                    float  s = 0.0f;
+                    for (int j = 0; j < V; j++) s += expf(row[j] - vmax);
+                    vl += -(row[tgt] - vmax) + logf(s);
+                }
+                val_loss += vl / (float)seq_len;
             }
-            printf("  [val] step %d | val_loss ~=%.4f\n",
-                   step, val_loss / (float)val_steps);
+            val_loss /= (float)val_steps;
+            printf("  [val] step=%-6d  val_loss=%.4f  train_smooth=%.4f  gap=%.4f\n",
+                   step, val_loss, (float)smooth_loss,
+                   val_loss - (float)smooth_loss);
+            fflush(stdout);
         }
 
         /* Checkpoint */
@@ -508,12 +542,19 @@ void train(Model *m, const TrainConfig *tcfg) {
             if (model_save(m, path) == 0)
                 printf("  [ckpt] saved: %s\n", path);
             else
-                fprintf(stderr, "  [ckpt] FAILED to save: %s\n", path);
+                fprintf(stderr, "  [ckpt] FAILED: %s\n", path);
         }
     }
 
-    printf("[train] done. avg loss: %.4f\n",
-           total_loss / (double)tcfg->max_steps);
+    mat_free(&val_logits);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double total_sec = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec)*1e-9;
+    long total_tokens = (long)tcfg->max_steps * tokens_per_step;
+    printf("\n[train] done in %.1fs | avg_loss=%.4f | %.0f tok/s\n",
+           total_sec,
+           total_loss / (double)tcfg->max_steps,
+           (double)total_tokens / total_sec);
 
     free(batch_in);
     free(batch_tgt);

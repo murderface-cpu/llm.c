@@ -50,6 +50,9 @@
 
 #include "../include/matrix.h"
 #include "../include/simd.h"
+#ifdef USE_OPENBLAS
+#  include <cblas.h>
+#endif
 
 /* OpenMP: included only when -fopenmp is passed to the compiler.
  * Without -fopenmp every omp_ call is a no-op stub, so the code
@@ -356,43 +359,47 @@ void mat_mul(const Matrix *A, const Matrix *B, Matrix *out) {
     assert(out->rows == A->rows && out->cols == B->cols);
 
     int M = A->rows, K = A->cols, N = B->cols;
-    mat_zero(out);
 
-#if defined(SIMD_AVX2FMA)
+#ifdef USE_OPENBLAS
     /*
-     * Parallelised, blocked (k0, i0, j0) loop with AVX2+FMA axpy kernel.
+     * OpenBLAS sgemm: C = alpha*A*B + beta*C
+     * This is a highly-optimised BLAS routine that uses AVX-512, multi-threading,
+     * and cache-optimal micro-kernels tuned for the specific CPU at compile time.
+     * Typically 5-20x faster than our hand-rolled kernel for the sizes used in
+     * transformer training (e.g. [512×512]×[512×4096]).
      *
-     * #pragma omp parallel for schedule(dynamic) on i0:
-     *   dynamic scheduling handles uneven tile sizes at the matrix edges.
-     *   Each thread processes MC rows of output independently.
+     * beta=0.0f means C is overwritten (no need to zero first).
      */
+    cblas_sgemm(CblasRowMajor,
+                CblasNoTrans, CblasNoTrans,
+                M, N, K,
+                1.0f,           /* alpha */
+                A->data, K,     /* A, lda */
+                B->data, N,     /* B, ldb */
+                0.0f,           /* beta — overwrites out */
+                out->data, N);  /* C, ldc */
+#elif defined(SIMD_AVX2FMA)
+    mat_zero(out);
     for (int k0 = 0; k0 < K; k0 += KC) {
         int kc = K - k0 < KC ? K - k0 : KC;
-
         #pragma omp parallel for schedule(dynamic) if(M >= 2*MC)
         for (int i0 = 0; i0 < M; i0 += MC) {
             int mc = M - i0 < MC ? M - i0 : MC;
-
             for (int j0 = 0; j0 < N; j0 += NC) {
                 int nc = N - j0 < NC ? N - j0 : NC;
-
-                /* Micro-kernel: process mc rows × nc columns */
                 for (int i = i0; i < i0 + mc; i++) {
                     float *out_row = out->data + i * N + j0;
                     for (int k = k0; k < k0 + kc; k++) {
                         float a_ik = A->data[i * K + k];
                         if (a_ik == 0.0f) continue;
-                        axpy_avx2fma(out_row, B->data + k * N + j0,
-                                     a_ik, nc);
+                        axpy_avx2fma(out_row, B->data + k * N + j0, a_ik, nc);
                     }
                 }
             }
-        } /* end omp parallel for i0 */
+        }
     }
 #else
-    /*
-     * Scalar fallback with OpenMP row-parallelism.
-     */
+    mat_zero(out);
     #pragma omp parallel for schedule(static) if(M >= 64)
     for (int i = 0; i < M; i++) {
         for (int k = 0; k < K; k++) {
@@ -446,15 +453,22 @@ void mat_mul_T(const Matrix *A, const Matrix *B, Matrix *out) {
 
     int M = A->rows, K = A->cols, N = B->rows;
 
-#if defined(SIMD_AVX2FMA)
-    /* Each (i,j) output element is independent — embarrassingly parallel. */
+#ifdef USE_OPENBLAS
+    /* out = A × Bᵀ  — pass CblasTrans for B */
+    cblas_sgemm(CblasRowMajor,
+                CblasNoTrans, CblasTrans,
+                M, N, K,
+                1.0f,
+                A->data, K,
+                B->data, K,   /* ldb = K because B is stored [N×K] */
+                0.0f,
+                out->data, N);
+#elif defined(SIMD_AVX2FMA)
     #pragma omp parallel for schedule(static) if(M*N >= 512)
     for (int i = 0; i < M; i++) {
         const float *a_row = A->data + i * K;
-        for (int j = 0; j < N; j++) {
-            out->data[i * N + j] =
-                dot_avx2fma(a_row, B->data + j * K, K);
-        }
+        for (int j = 0; j < N; j++)
+            out->data[i * N + j] = dot_avx2fma(a_row, B->data + j * K, K);
     }
 #else
     mat_zero(out);

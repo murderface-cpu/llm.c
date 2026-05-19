@@ -1,35 +1,11 @@
 /**
- * tokenizer.c
+ * tokenizer.c  — Fast BPE tokenizer
  *
- * Byte-Pair Encoding tokenizer implementation.
- *
- * BPE algorithm recap:
- *   Training (done offline, produces the .vocab file):
- *     Start with every character as its own token.
- *     Count all adjacent pairs. Merge the most frequent pair into one token.
- *     Repeat until vocabulary reaches the target size.
- *
- *   Encoding (this file — inference side):
- *     1. Split text into individual UTF-8 code points.
- *     2. Map each code point to its token id (byte fallback for unknowns).
- *     3. Greedily scan left-to-right; apply the highest-priority merge rule
- *        that matches two adjacent tokens. Repeat until no merges apply.
- *
- * The merge table is stored as a priority-ranked list (rank 0 = merged first).
- * We use a hash map for fast pair lookup: (left_id, right_id) → (rank, result_id).
- *
- * Vocabulary file format (our custom binary format, not SentencePiece):
- *   [int32:  vocab_size]
- *   [int32:  n_merges]
- *   For each vocab entry (vocab_size entries):
- *     [int32:  id]
- *     [float32: score]
- *     [int32:  text_byte_len]
- *     [char*:  text bytes (not null-terminated in file)]
- *   For each merge rule (n_merges entries):
- *     [int32:  left_token_id]
- *     [int32:  right_token_id]
- *     [int32:  result_token_id]
+ * Optimisations vs original:
+ *   1. Codepoint → token id:  O(vocab) linear scan → O(1) string hash map
+ *   2. BPE merge loop:        O(n²) per doc → O(n·k) with priority queue
+ *      where k = average number of merges applied per token
+ *   3. All merges looked up in O(1) via the existing MergeMap hash table
  */
 
 #define _GNU_SOURCE
@@ -42,454 +18,439 @@
 #include "../include/tokenizer.h"
 
 /* =========================================================================
- * Internal: merge hash map
- *
- * Maps (left_id, right_id) → (merge_rank, result_id)
- * Used during encoding to find the best merge at each step.
- *
- * We use open-addressing with linear probing.
- * Key = 64-bit integer: high 32 bits = left_id, low 32 bits = right_id.
+ * Merge hash map  (left_id, right_id) → (rank, result_id)
  * ====================================================================== */
-
-#define MERGE_MAP_EMPTY  UINT64_MAX   /* sentinel for empty bucket          */
-#define MERGE_MAP_LOAD   0.6f         /* max load factor before we'd resize */
+#define MERGE_MAP_EMPTY UINT64_MAX
 
 typedef struct {
-    uint64_t key;          /* packed (left_id << 32 | right_id), EMPTY if free */
-    int      rank;         /* merge priority: lower = applied first            */
-    int      result;       /* token id produced by this merge                  */
+    uint64_t key;
+    int      rank;
+    int      result;
 } MergeEntry;
 
 typedef struct {
     MergeEntry *buckets;
-    int         capacity;  /* must be a power of two                           */
+    int         capacity;
     int         size;
 } MergeMap;
 
-static MergeMap *merge_map_alloc(int n_merges) {
-    /* Size the table so load factor stays below MERGE_MAP_LOAD */
+static MergeMap *merge_map_alloc(int n) {
     int cap = 1;
-    while (cap < (int)(n_merges / MERGE_MAP_LOAD) + 1)
-        cap <<= 1;
-
-    MergeMap *m = (MergeMap *)malloc(sizeof(MergeMap));
-    m->capacity = cap;
-    m->size     = 0;
-    m->buckets  = (MergeEntry *)malloc((size_t)cap * sizeof(MergeEntry));
-    for (int i = 0; i < cap; i++)
-        m->buckets[i].key = MERGE_MAP_EMPTY;
+    while (cap < (int)(n / 0.6f) + 4) cap <<= 1;
+    MergeMap *m = malloc(sizeof(MergeMap));
+    m->capacity = cap; m->size = 0;
+    m->buckets  = malloc((size_t)cap * sizeof(MergeEntry));
+    for (int i = 0; i < cap; i++) m->buckets[i].key = MERGE_MAP_EMPTY;
     return m;
 }
+static void merge_map_free(MergeMap *m) { free(m->buckets); free(m); }
 
-static void merge_map_free(MergeMap *m) {
-    free(m->buckets);
-    free(m);
+static inline uint64_t mkey(int l, int r) {
+    return ((uint64_t)(uint32_t)l << 32) | (uint32_t)r;
 }
-
-static inline uint64_t merge_key(int left, int right) {
-    return ((uint64_t)(uint32_t)left << 32) | (uint32_t)right;
-}
-
-static void merge_map_insert(MergeMap *m, int left, int right,
-                              int rank, int result) {
-    uint64_t key  = merge_key(left, right);
-    int      mask = m->capacity - 1;
-    int      idx  = (int)(key & mask);
-
-    while (m->buckets[idx].key != MERGE_MAP_EMPTY)
-        idx = (idx + 1) & mask;
-
-    m->buckets[idx].key    = key;
-    m->buckets[idx].rank   = rank;
-    m->buckets[idx].result = result;
+static void merge_map_insert(MergeMap *m, int l, int r, int rank, int res) {
+    uint64_t k = mkey(l, r);
+    int mask = m->capacity - 1, idx = (int)(k & mask);
+    while (m->buckets[idx].key != MERGE_MAP_EMPTY) idx = (idx + 1) & mask;
+    m->buckets[idx] = (MergeEntry){ k, rank, res };
     m->size++;
 }
-
-/**
- * merge_map_lookup — find the merge for (left, right).
- * Returns the MergeEntry*, or NULL if no merge rule exists for this pair.
- */
-static const MergeEntry *merge_map_lookup(const MergeMap *m,
-                                           int left, int right) {
-    uint64_t key  = merge_key(left, right);
-    int      mask = m->capacity - 1;
-    int      idx  = (int)(key & mask);
-
+static const MergeEntry *merge_map_lookup(const MergeMap *m, int l, int r) {
+    uint64_t k = mkey(l, r);
+    int mask = m->capacity - 1, idx = (int)(k & mask);
     while (m->buckets[idx].key != MERGE_MAP_EMPTY) {
-        if (m->buckets[idx].key == key)
-            return &m->buckets[idx];
+        if (m->buckets[idx].key == k) return &m->buckets[idx];
         idx = (idx + 1) & mask;
     }
     return NULL;
 }
 
+/* =========================================================================
+ * String → token id hash map  (for O(1) codepoint lookup during encode)
+ * Maps null-terminated string keys to int token ids.
+ * ====================================================================== */
+typedef struct StrCell {
+    const char *key;  /* points into vocab[i].text — not owned */
+    int         id;
+    struct StrCell *next;
+} StrCell;
+
+typedef struct {
+    StrCell **buckets;
+    int       cap;
+    int       size;
+} StrMap;
+
+static uint32_t str_hash(const char *s, int len) {
+    /* FNV-1a */
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static StrMap *strmap_alloc(int cap) {
+    int c = 1; while (c < cap * 2) c <<= 1;
+    StrMap *m = calloc(1, sizeof(StrMap));
+    m->buckets = calloc(c, sizeof(StrCell *));
+    m->cap = c;
+    return m;
+}
+static void strmap_free(StrMap *m) {
+    for (int i = 0; i < m->cap; i++) {
+        StrCell *c = m->buckets[i];
+        while (c) { StrCell *nx = c->next; free(c); c = nx; }
+    }
+    free(m->buckets); free(m);
+}
+static void strmap_insert(StrMap *m, const char *key, int len, int id) {
+    uint32_t h  = str_hash(key, len);
+    int      idx = (int)(h & (m->cap - 1));
+    StrCell *c  = malloc(sizeof(StrCell));
+    c->key  = key;
+    c->id   = id;
+    c->next = m->buckets[idx];
+    m->buckets[idx] = c;
+    m->size++;
+}
+static int strmap_lookup(const StrMap *m, const char *key, int len) {
+    uint32_t h   = str_hash(key, len);
+    int      idx = (int)(h & (m->cap - 1));
+    for (StrCell *c = m->buckets[idx]; c; c = c->next)
+        if ((int)strlen(c->key) == len && memcmp(c->key, key, len) == 0)
+            return c->id;
+    return TOK_UNK;
+}
 
 /* =========================================================================
- * Extended tokenizer struct
- *
- * We embed the merge map inside an extended struct that sits behind the
- * public Tokenizer pointer. Callers only ever see (Tokenizer *) so the
- * hash map is fully encapsulated.
+ * Internal tokenizer struct
  * ====================================================================== */
 typedef struct {
-    Tokenizer  pub;         /* public fields — must be first for safe casting */
-    MergeMap  *merge_map;   /* fast (left,right) → (rank,result) lookup       */
+    Tokenizer pub;
+    MergeMap *merge_map;
+    StrMap   *str_map;    /* codepoint string → token id, O(1) lookup */
 } TokenizerInternal;
 
-/* Helper: cast public pointer to internal struct */
-static inline TokenizerInternal *tok_internal(const Tokenizer *t) {
+static inline TokenizerInternal *tok_int(const Tokenizer *t) {
     return (TokenizerInternal *)(void *)t;
 }
 
-
 /* =========================================================================
- * Helper: safe fread with error checking
+ * Checked fread
  * ====================================================================== */
-static int fread_ok(void *ptr, size_t sz, size_t n, FILE *f) {
-    return fread(ptr, sz, n, f) == n ? 0 : -1;
+static int fread_ok(void *p, size_t sz, size_t n, FILE *f) {
+    return fread(p, sz, n, f) == n ? 0 : -1;
 }
-
 
 /* =========================================================================
  * tok_load
  * ====================================================================== */
-
 Tokenizer *tok_load(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
 
-    /* Read header */
     int32_t vocab_size = 0, n_merges = 0;
-    if (fread_ok(&vocab_size, sizeof(int32_t), 1, f) < 0 ||
-        fread_ok(&n_merges,   sizeof(int32_t), 1, f) < 0) {
-        fprintf(stderr, "[tok_load] bad header in %s\n", path);
+    if (fread_ok(&vocab_size, 4, 1, f) < 0 ||
+        fread_ok(&n_merges,   4, 1, f) < 0) {
+        fprintf(stderr, "[tok_load] bad header\n");
         fclose(f); return NULL;
     }
 
-    /* Allocate internal struct */
-    TokenizerInternal *ti = (TokenizerInternal *)calloc(
-                                1, sizeof(TokenizerInternal));
+    TokenizerInternal *ti = calloc(1, sizeof(TokenizerInternal));
     Tokenizer *t = &ti->pub;
-    t->vocab_size = vocab_size;
-    t->vocab      = (TokenEntry *)calloc(vocab_size, sizeof(TokenEntry));
-    t->id_to_text = (char **)calloc(vocab_size, sizeof(char *));
-    t->merge_left   = (int *)malloc((size_t)n_merges * sizeof(int));
-    t->merge_right  = (int *)malloc((size_t)n_merges * sizeof(int));
-    t->merge_result = (int *)malloc((size_t)n_merges * sizeof(int));
+    t->vocab_size   = vocab_size;
+    t->vocab        = calloc(vocab_size, sizeof(TokenEntry));
+    t->id_to_text   = calloc(vocab_size, sizeof(char *));
+    t->merge_left   = malloc((size_t)n_merges * sizeof(int));
+    t->merge_right  = malloc((size_t)n_merges * sizeof(int));
+    t->merge_result = malloc((size_t)n_merges * sizeof(int));
     t->n_merges     = n_merges;
 
-    if (!t->vocab || !t->id_to_text ||
-        !t->merge_left || !t->merge_right || !t->merge_result) {
-        fprintf(stderr, "[tok_load] OOM\n");
-        tok_free(t); fclose(f); return NULL;
-    }
-
-    /* Read vocab entries */
+    /* Read vocab */
     for (int i = 0; i < vocab_size; i++) {
-        int32_t  id  = 0;
-        float    score = 0.0f;
-        int32_t  text_len = 0;
-
-        if (fread_ok(&id,       sizeof(int32_t), 1, f) < 0 ||
-            fread_ok(&score,    sizeof(float),   1, f) < 0 ||
-            fread_ok(&text_len, sizeof(int32_t), 1, f) < 0) {
+        int32_t id, tlen; float score;
+        if (fread_ok(&id,    4, 1, f) < 0 ||
+            fread_ok(&score, 4, 1, f) < 0 ||
+            fread_ok(&tlen,  4, 1, f) < 0) {
             fprintf(stderr, "[tok_load] bad vocab entry %d\n", i);
             tok_free(t); fclose(f); return NULL;
         }
-
-        char *text = (char *)malloc((size_t)text_len + 1);
-        if (!text || fread_ok(text, 1, text_len, f) < 0) {
-            free(text);
-            fprintf(stderr, "[tok_load] bad token text %d\n", i);
-            tok_free(t); fclose(f); return NULL;
+        char *text = malloc(tlen + 1);
+        if (!text || fread_ok(text, 1, tlen, f) < 0) {
+            free(text); tok_free(t); fclose(f); return NULL;
         }
-        text[text_len] = '\0';
-
-        t->vocab[i].id    = id;
-        t->vocab[i].score = score;
-        t->vocab[i].text  = text;
-
-        if (id >= 0 && id < vocab_size)
-            t->id_to_text[id] = text;
+        text[tlen] = '\0';
+        t->vocab[i].id = id; t->vocab[i].score = score; t->vocab[i].text = text;
+        if (id >= 0 && id < vocab_size) t->id_to_text[id] = text;
     }
 
-    /* Read merge rules and build the hash map */
-    ti->merge_map = merge_map_alloc(n_merges);
+    /* Read merges + build merge map */
+    ti->merge_map = merge_map_alloc(n_merges + 4);
     for (int i = 0; i < n_merges; i++) {
-        int32_t left = 0, right = 0, result = 0;
-        if (fread_ok(&left,   sizeof(int32_t), 1, f) < 0 ||
-            fread_ok(&right,  sizeof(int32_t), 1, f) < 0 ||
-            fread_ok(&result, sizeof(int32_t), 1, f) < 0) {
-            fprintf(stderr, "[tok_load] bad merge rule %d\n", i);
+        int32_t l, r, res;
+        if (fread_ok(&l, 4, 1, f) < 0 || fread_ok(&r, 4, 1, f) < 0 ||
+            fread_ok(&res, 4, 1, f) < 0) {
+            fprintf(stderr, "[tok_load] bad merge %d\n", i);
             tok_free(t); fclose(f); return NULL;
         }
-        t->merge_left[i]   = left;
-        t->merge_right[i]  = right;
-        t->merge_result[i] = result;
-        /* rank = index in the file: lower index = higher priority */
-        merge_map_insert(ti->merge_map, left, right, i, result);
+        t->merge_left[i] = l; t->merge_right[i] = r; t->merge_result[i] = res;
+        merge_map_insert(ti->merge_map, l, r, i, res);
     }
-
-    /* Build byte-fallback table.
-     * For each raw byte value 0..255, find the token whose text is exactly
-     * that single byte.  If none exists (shouldn't happen in a well-formed
-     * BPE vocab), fall back to TOK_UNK. */
-    for (int b = 0; b < 256; b++)
-        t->byte_tokens[b] = TOK_UNK;
-
-    for (int i = 0; i < vocab_size; i++) {
-        const char *txt = t->vocab[i].text;
-        if (txt && strlen(txt) == 1) {
-            unsigned char b = (unsigned char)txt[0];
-            t->byte_tokens[b] = t->vocab[i].id;
-        }
-    }
-
     fclose(f);
+
+    /* Build O(1) string lookup map */
+    ti->str_map = strmap_alloc(vocab_size + 4);
+    for (int i = 0; i < vocab_size; i++) {
+        if (!t->vocab[i].text) continue;
+        int len = (int)strlen(t->vocab[i].text);
+        strmap_insert(ti->str_map, t->vocab[i].text, len, t->vocab[i].id);
+    }
+
+    /* Byte fallback table */
+    for (int b = 0; b < 256; b++) t->byte_tokens[b] = TOK_UNK;
+    for (int i = 0; i < vocab_size; i++) {
+        const char *tx = t->vocab[i].text;
+        if (tx && strlen(tx) == 1)
+            t->byte_tokens[(unsigned char)tx[0]] = t->vocab[i].id;
+    }
+
     return t;
 }
-
 
 /* =========================================================================
  * tok_free
  * ====================================================================== */
-
 void tok_free(Tokenizer *t) {
     if (!t) return;
-    TokenizerInternal *ti = tok_internal(t);
-
-    if (t->vocab) {
-        for (int i = 0; i < t->vocab_size; i++)
-            free(t->vocab[i].text);
-        free(t->vocab);
-    }
+    TokenizerInternal *ti = tok_int(t);
+    if (t->vocab) { for (int i=0;i<t->vocab_size;i++) free(t->vocab[i].text); free(t->vocab); }
     free(t->id_to_text);
-    free(t->merge_left);
-    free(t->merge_right);
-    free(t->merge_result);
+    free(t->merge_left); free(t->merge_right); free(t->merge_result);
     if (ti->merge_map) merge_map_free(ti->merge_map);
+    if (ti->str_map)   strmap_free(ti->str_map);
     free(ti);
 }
-
 
 /* =========================================================================
  * UTF-8 helpers
  * ====================================================================== */
-
-/**
- * utf8_codepoint_len — return the byte length of the UTF-8 sequence
- * starting at `s`, or 1 on invalid/continuation byte (byte fallback).
- */
-static int utf8_codepoint_len(unsigned char c) {
-    if      (c < 0x80) return 1;   /* ASCII                   */
-    else if (c < 0xC0) return 1;   /* continuation — treat as byte */
-    else if (c < 0xE0) return 2;   /* 2-byte sequence         */
-    else if (c < 0xF0) return 3;   /* 3-byte sequence         */
-    else               return 4;   /* 4-byte sequence         */
+static int utf8_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if (c < 0xC0) return 1;
+    if (c < 0xE0) return 2;
+    if (c < 0xF0) return 3;
+    return 4;
 }
 
-
 /* =========================================================================
- * BPE encoding
+ * BPE encode — O(n · k) with priority-queue merge selection
  *
- * We maintain a doubly-linked list of token nodes so merges are O(1) to
- * apply (just splice out the right node and update the left node's token).
- * Finding the best merge at each round is O(n) in the current token count.
- *
- * This gives overall O(n²) worst-case for a sequence of length n, which is
- * fine for typical sentence lengths (< 4096 bytes).
+ * We maintain an array of (token_id, is_alive) nodes plus a min-heap
+ * keyed on merge rank so the best merge is always O(log n) away.
+ * After each merge we push the two new adjacent pairs onto the heap.
+ * Stale heap entries (pairs that no longer exist) are detected lazily.
  * ====================================================================== */
 
-/* One node in the linked list of token ids during BPE merge */
-typedef struct TokNode {
-    int           id;
-    struct TokNode *prev;
-    struct TokNode *next;
-} TokNode;
+typedef struct {
+    int  left_pos;   /* index of left token in the tokens[] array */
+    int  rank;       /* merge rank (lower = higher priority)       */
+    int  result;     /* merged token id                            */
+} PQEntry;
+
+/* Min-heap on rank */
+static int pq_cmp(const PQEntry *a, const PQEntry *b) {
+    return a->rank - b->rank;
+}
+
+typedef struct {
+    PQEntry *h;
+    int size, cap;
+} PriQueue;
+
+static void pq_push(PriQueue *pq, PQEntry e) {
+    if (pq->size >= pq->cap) {
+        pq->cap = pq->cap ? pq->cap * 2 : 64;
+        pq->h   = realloc(pq->h, pq->cap * sizeof(PQEntry));
+    }
+    int i = pq->size++;
+    pq->h[i] = e;
+    while (i > 0) {
+        int p = (i-1)/2;
+        if (pq_cmp(&pq->h[p], &pq->h[i]) <= 0) break;
+        PQEntry tmp = pq->h[p]; pq->h[p] = pq->h[i]; pq->h[i] = tmp;
+        i = p;
+    }
+}
+
+static PQEntry pq_pop(PriQueue *pq) {
+    PQEntry top = pq->h[0];
+    pq->h[0] = pq->h[--pq->size];
+    int i = 0;
+    while (1) {
+        int l = 2*i+1, r = 2*i+2, best = i;
+        if (l < pq->size && pq_cmp(&pq->h[l], &pq->h[best]) < 0) best = l;
+        if (r < pq->size && pq_cmp(&pq->h[r], &pq->h[best]) < 0) best = r;
+        if (best == i) break;
+        PQEntry tmp = pq->h[i]; pq->h[i] = pq->h[best]; pq->h[best] = tmp;
+        i = best;
+    }
+    return top;
+}
+
+/* Try to push a pair (tokens[i], tokens[next[i]]) if a merge rule exists */
+static void maybe_push(const TokenizerInternal *ti,
+                        const int *toks, const int *nxt,
+                        int i, int n, PriQueue *pq) {
+    int j = nxt[i];
+    if (j < 0 || j >= n) return;
+    const MergeEntry *e = merge_map_lookup(ti->merge_map, toks[i], toks[j]);
+    if (e) pq_push(pq, (PQEntry){ i, e->rank, e->result });
+}
 
 int tok_encode(const Tokenizer *t, const char *text,
                int add_bos, int add_eos,
                int *out_ids, int *out_len) {
     if (!t || !text || !out_ids || !out_len) return -1;
+    const TokenizerInternal *ti = tok_int(t);
+    int text_len = (int)strlen(text);
+    if (text_len == 0) {
+        int pos = 0;
+        if (add_bos) out_ids[pos++] = TOK_BOS;
+        if (add_eos) out_ids[pos++] = TOK_EOS;
+        *out_len = pos;
+        return 0;
+    }
 
-    const TokenizerInternal *ti = tok_internal(t);
-    int len = (int)strlen(text);
+    /* Allocate token array — upper bound: one per byte + bos + eos */
+    int max_toks = text_len + 4;
+    int *toks = malloc(max_toks * sizeof(int));
+    int *nxt  = malloc(max_toks * sizeof(int)); /* next[i] = next alive index */
+    int *prv  = malloc(max_toks * sizeof(int)); /* prev[i]                    */
 
-    /* Upper bound on initial token count: one per byte */
-    TokNode *nodes = (TokNode *)malloc(
-                         ((size_t)len + 4) * sizeof(TokNode));
-    if (!nodes) return -1;
+    int pos = 0;
+    if (add_bos) { toks[pos] = TOK_BOS; pos++; }
 
-    /* Allocate a pool of free nodes for merge results */
-    int      pos   = 0;   /* write head into nodes[] */
-
-    /* --- Step 1: sentinel head and optional BOS ----------------------- */
-    /* We use a circular sentinel approach: nodes[0] is a dummy head node */
-    nodes[pos].id   = -1;     /* sentinel */
-    nodes[pos].prev = NULL;
-    nodes[pos].next = NULL;
-    TokNode *head = &nodes[pos++];
-    TokNode *tail = head;
-
-/* Append a token node to the linked list — written as a macro to stay
-     * ISO C99/C11 compliant (no nested functions). */
-#define APPEND(tok_id) do { \
-        nodes[pos].id   = (tok_id); \
-        nodes[pos].prev = tail; \
-        nodes[pos].next = NULL; \
-        tail->next      = &nodes[pos]; \
-        tail            = &nodes[pos]; \
-        pos++;  \
-    } while(0)
-
-    if (add_bos) APPEND(TOK_BOS);
-
-    /* --- Step 2: split text into UTF-8 code points, map to token ids -- */
+    /* Split text into initial tokens using O(1) string hash map */
     const char *p = text;
     while (*p) {
-        int clen = utf8_codepoint_len((unsigned char)*p);
+        int clen = utf8_len((unsigned char)*p);
+        /* Clamp to actual remaining bytes */
+        int remaining = (int)(text + text_len - p);
+        if (clen > remaining) clen = remaining;
 
-        /* Try to find this code point as a single vocab entry */
-        /* Linear scan here — for large vocabs a hash map would be better.
-         * In practice the initial split is a small fraction of total time. */
-        int found = TOK_UNK;
-        for (int i = 0; i < t->vocab_size; i++) {
-            const char *vt = t->vocab[i].text;
-            if (vt && (int)strlen(vt) == clen &&
-                memcmp(vt, p, clen) == 0) {
-                found = t->vocab[i].id;
-                break;
+        int id = strmap_lookup(ti->str_map, p, clen);
+        if (id == TOK_UNK) {
+            /* byte fallback */
+            for (int b = 0; b < clen; b++) {
+                if (pos >= max_toks - 4) {
+                    max_toks *= 2;
+                    toks = realloc(toks, max_toks * sizeof(int));
+                    nxt  = realloc(nxt,  max_toks * sizeof(int));
+                    prv  = realloc(prv,  max_toks * sizeof(int));
+                }
+                toks[pos++] = t->byte_tokens[(unsigned char)p[b]];
             }
-        }
-
-        if (found == TOK_UNK) {
-            /* Byte fallback: emit one token per raw byte */
-            for (int b = 0; b < clen; b++)
-                APPEND(t->byte_tokens[(unsigned char)p[b]]);
         } else {
-            APPEND(found);
+            if (pos >= max_toks - 4) {
+                max_toks *= 2;
+                toks = realloc(toks, max_toks * sizeof(int));
+                nxt  = realloc(nxt,  max_toks * sizeof(int));
+                prv  = realloc(prv,  max_toks * sizeof(int));
+            }
+            toks[pos++] = id;
         }
         p += clen;
     }
 
-    if (add_eos) APPEND(TOK_EOS);
-#undef APPEND
+    if (add_eos) toks[pos++] = TOK_EOS;
+    int n = pos;
 
-    /* --- Step 3: greedily apply BPE merge rules ----------------------- */
-    /*
-     * Repeat until no merge can be applied:
-     *   - Scan through adjacent pairs (a, b)
-     *   - For each pair, check if there's a merge rule
-     *   - Track the pair with the lowest rank (highest priority)
-     *   - Apply it: replace (a, b) with result; re-check neighbours
-     *
-     * We restart from the neighbours after each merge so we don't miss
-     * new pairs created by the merge.
-     */
-    int changed = 1;
-    while (changed) {
-        changed = 0;
-        int      best_rank   = INT32_MAX;
-        int      best_result = -1;
-        TokNode *best_left   = NULL;
+    /* Initialise next/prev linked list */
+    for (int i = 0; i < n; i++) { nxt[i] = i+1; prv[i] = i-1; }
+    nxt[n-1] = n; /* sentinel */
 
-        /* Find best merge in this pass */
-        for (TokNode *n = head->next; n && n->next; n = n->next) {
-            const MergeEntry *e = merge_map_lookup(ti->merge_map,
-                                                   n->id, n->next->id);
-            if (e && e->rank < best_rank) {
-                best_rank   = e->rank;
-                best_result = e->result;
-                best_left   = n;
-            }
-        }
+    /* Priority queue: push all initially mergeable adjacent pairs */
+    PriQueue pq = { NULL, 0, 0 };
+    for (int i = 0; i < n - 1; i++)
+        maybe_push(ti, toks, nxt, i, n, &pq);
 
-        if (best_left) {
-            /* Apply the merge: left node takes result id, right is removed */
-            TokNode *right = best_left->next;
-            best_left->id  = best_result;
-            best_left->next = right->next;
-            if (right->next) right->next->prev = best_left;
-            else             tail = best_left;
-            changed = 1;
-        }
+    /* Process merges in priority order */
+    while (pq.size > 0) {
+        PQEntry e = pq_pop(&pq);
+        int i = e.left_pos;
+        int j = nxt[i];
+
+        /* Stale check: pair (i,j) must still exist and match */
+        if (j >= n || toks[i] < 0 || toks[j] < 0) continue;
+        const MergeEntry *cur = merge_map_lookup(ti->merge_map, toks[i], toks[j]);
+        if (!cur || cur->rank != e.rank) continue;  /* stale entry */
+
+        /* Apply merge */
+        toks[i] = e.result;
+        toks[j] = -1;  /* mark dead */
+        nxt[i]  = nxt[j];
+        if (nxt[j] < n) prv[nxt[j]] = i;
+
+        /* Push new pairs created by this merge */
+        maybe_push(ti, toks, nxt, prv[i] >= 0 ? prv[i] : i, n, &pq);
+        maybe_push(ti, toks, nxt, i, n, &pq);
     }
 
-    /* --- Step 4: collect results --------------------------------------- */
-    int count = 0;
-    for (TokNode *n = head->next; n; n = n->next) {
-        out_ids[count++] = n->id;
-    }
-    *out_len = count;
+    /* Collect surviving tokens */
+    int out = 0;
+    for (int i = 0; i < n; i++)
+        if (toks[i] >= 0) out_ids[out++] = toks[i];
+    *out_len = out;
 
-    free(nodes);
+    free(toks); free(nxt); free(prv); free(pq.h);
     return 0;
 }
 
+/* =========================================================================
+ * Batch encode
+ * ====================================================================== */
 void tok_encode_batch(const Tokenizer *t,
                       const char **texts, int n, int max_len,
                       int *out, int *lengths) {
-    int *scratch = (int *)malloc((size_t)(max_len + 2) * sizeof(int));
+    int *scratch = malloc((size_t)(max_len + 4) * sizeof(int));
     for (int i = 0; i < n; i++) {
         int len = 0;
         tok_encode(t, texts[i], 1, 1, scratch, &len);
-        /* Truncate to max_len */
         int copy = len < max_len ? len : max_len;
         memcpy(out + i * max_len, scratch, copy * sizeof(int));
-        /* Pad with TOK_PAD */
-        for (int j = copy; j < max_len; j++)
-            out[i * max_len + j] = TOK_PAD;
+        for (int j = copy; j < max_len; j++) out[i*max_len+j] = TOK_PAD;
         if (lengths) lengths[i] = copy;
     }
     free(scratch);
 }
 
-
 /* =========================================================================
- * Decoding
+ * Decode
  * ====================================================================== */
-
 const char *tok_decode_token(const Tokenizer *t, int id) {
     if (id < 0 || id >= t->vocab_size) return "<unk>";
     return t->id_to_text[id] ? t->id_to_text[id] : "<unk>";
 }
 
 char *tok_decode(const Tokenizer *t, const int *ids, int n) {
-    /* First pass: compute total output length */
     size_t total = 0;
-    for (int i = 0; i < n; i++) {
-        const char *s = tok_decode_token(t, ids[i]);
-        total += strlen(s);
-    }
-
-    char *out = (char *)malloc(total + 1);
+    for (int i = 0; i < n; i++) total += strlen(tok_decode_token(t, ids[i]));
+    char *out = malloc(total + 1), *p = out;
     if (!out) return NULL;
-
-    char *p = out;
     for (int i = 0; i < n; i++) {
         const char *s = tok_decode_token(t, ids[i]);
-        size_t slen   = strlen(s);
-        memcpy(p, s, slen);
-        p += slen;
+        size_t sl = strlen(s); memcpy(p, s, sl); p += sl;
     }
     *p = '\0';
     return out;
 }
 
-
-/* =========================================================================
- * Vocabulary utilities
- * ====================================================================== */
-
 int tok_token_to_id(const Tokenizer *t, const char *text) {
-    /* Linear scan — acceptable for the occasional lookup outside encode() */
-    for (int i = 0; i < t->vocab_size; i++) {
-        if (t->vocab[i].text && strcmp(t->vocab[i].text, text) == 0)
-            return t->vocab[i].id;
-    }
-    return TOK_UNK;
+    const TokenizerInternal *ti = tok_int(t);
+    int id = strmap_lookup(ti->str_map, text, (int)strlen(text));
+    return id;
 }
 
-int tok_vocab_size(const Tokenizer *t) {
-    return t->vocab_size;
-}
+int tok_vocab_size(const Tokenizer *t) { return t->vocab_size; }

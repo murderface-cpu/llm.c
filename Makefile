@@ -1,21 +1,25 @@
 # =============================================================================
 # llm.c Makefile
-#
-# Targets:
-#   make                — build main training binary
-#   make tools          — build build_vocab and prepare_data
-#   make all            — build everything
-#   make test           — build and run all unit tests
-#   make debug          — debug build with sanitizers
-#   make clean          — remove build artifacts
 # =============================================================================
-
 CC      = gcc
-CFLAGS  = -std=c11 -Wall -Wextra -Wpedantic -Wno-unused-parameter
-LDFLAGS = -lm
+CFLAGS  = -std=c11 \
+           -Wall -Wextra -Wpedantic \
+           -Wno-unused-parameter \
+           -I$(INC_DIR)
+LDFLAGS = -lm -lopenblas
 
-RELEASE_FLAGS = -O3 -march=native -ffast-math -fopenmp
-DEBUG_FLAGS   = -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer -fopenmp
+RELEASE_FLAGS = -O3 \
+                -march=native \
+                -mtune=native \
+                -ffast-math \
+                -funroll-loops \
+                -fomit-frame-pointer \
+                -flto \
+                -fopenmp \
+                -DUSE_OPENBLAS
+
+DEBUG_FLAGS   = -O0 -g3 -fsanitize=address,undefined \
+                -fno-omit-frame-pointer -fopenmp -DUSE_OPENBLAS
 
 SRC_DIR   = src
 INC_DIR   = include
@@ -27,7 +31,8 @@ LIB_SRCS = $(SRC_DIR)/matrix.c     \
            $(SRC_DIR)/attention.c   \
            $(SRC_DIR)/transformer.c \
            $(SRC_DIR)/tokenizer.c   \
-           $(SRC_DIR)/inference.c
+           $(SRC_DIR)/inference.c   \
+           $(SRC_DIR)/nested.c
 
 TRAIN_SRC = $(SRC_DIR)/train.c \
             $(SRC_DIR)/main.c
@@ -46,7 +51,7 @@ $(BUILD_DIR)/train: $(LIB_SRCS) $(TRAIN_SRC) | $(BUILD_DIR)
 # Tools
 # =============================================================================
 .PHONY: tools
-tools: $(BUILD_DIR)/build_vocab $(BUILD_DIR)/prepare_data $(BUILD_DIR)/generate
+tools: $(BUILD_DIR)/build_vocab $(BUILD_DIR)/prepare_data $(BUILD_DIR)/generate $(BUILD_DIR)/train_nested
 
 $(BUILD_DIR)/build_vocab: $(TOOL_DIR)/build_vocab.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(RELEASE_FLAGS) $^ -o $@ $(LDFLAGS)
@@ -57,6 +62,10 @@ $(BUILD_DIR)/prepare_data: $(TOOL_DIR)/prepare_data.c $(SRC_DIR)/tokenizer.c | $
 	@echo "Built: $@"
 
 $(BUILD_DIR)/generate: $(SRC_DIR)/generate.c $(LIB_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(RELEASE_FLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "Built: $@"
+
+$(BUILD_DIR)/train_nested: $(TOOL_DIR)/train_nested.c $(LIB_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(RELEASE_FLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "Built: $@"
 
@@ -147,7 +156,7 @@ sample_run: tools train
 	@echo "--- Step 3: Train ---"
 	./$(BUILD_DIR)/train
 
-# Benchmark (not part of `make test` — run explicitly)
+# Benchmark
 .PHONY: bench
 bench: $(BUILD_DIR)/bench_matmul $(BUILD_DIR)/bench_inference
 	@echo ""
@@ -161,6 +170,4 @@ $(BUILD_DIR)/bench_matmul: $(TEST_DIR)/bench_matmul.c $(SRC_DIR)/matrix.c | $(BU
 
 $(BUILD_DIR)/bench_inference: $(TEST_DIR)/bench_inference.c $(LIB_SRCS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(RELEASE_FLAGS) $^ -o $@ $(LDFLAGS)
-	@echo "Built: $@"
-
 	@echo "Built: $@"
